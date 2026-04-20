@@ -1,0 +1,36 @@
+{
+  "contract_version": "1",
+  "oas_version_ref": "0.2.0",
+  "session_fields": {
+    "participant_id": {
+      "type": "string",
+      "description": "actor_id returned by orientation.identity.actor_id"
+    },
+    "space_id": {
+      "type": "string|null",
+      "description": "orientation.focus_space.space_id or null"
+    },
+    "orientation_summary": {
+      "type": "string",
+      "description": "orientation.context field (pre-formatted summary)"
+    }
+  },
+  "naming": {
+    "typescript": {
+      "participant_id": "participantId",
+      "space_id": "spaceId",
+      "orientation_summary": "orientationSummary"
+    },
+    "python": {
+      "participant_id": "participant_id",
+      "space_id": "space_id",
+      "orientation_summary": "orientation_summary"
+    }
+  },
+  "errors": {
+    "not_oriented": {
+      "typescript": "MootupNotOrientedError",
+      "python": "MootupNotOrientedError"
+    }
+  }
+}
