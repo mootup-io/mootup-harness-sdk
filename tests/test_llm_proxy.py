@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
@@ -420,3 +421,178 @@ async def test_r10_count_tokens_rejects_unknown_token(client: AsyncClient) -> No
         headers={"Authorization": "Bearer sk-unknown-prefix-XXX"},
     )
     assert r.status_code == 403
+
+
+# ── R11 reasoning round-trip (non-stream response + request echo) ──
+def test_r11_reasoning_response_prepends_thinking() -> None:
+    oai_resp = {
+        "id": "cmpl_r",
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "reasoning_content": "let me think...",
+                    "content": "the answer is 4",
+                },
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {"prompt_tokens": 3, "completion_tokens": 5},
+    }
+    anth = openai_format.openai_to_anthropic_response(
+        oai_resp, original_model="deepseek-v4-pro"
+    )
+    # Thinking comes first, with a non-empty (synthesized) signature.
+    assert anth["content"][0]["type"] == "thinking"
+    assert anth["content"][0]["thinking"] == "let me think..."
+    assert anth["content"][0]["signature"]
+    assert anth["content"][1] == {"type": "text", "text": "the answer is 4"}
+
+
+def test_r11_reasoning_request_echoes_reasoning_content() -> None:
+    # Turn 2: replay the assistant's thinking + tool_use. The thinking MUST come
+    # back to DeepSeek as reasoning_content on the assistant message or it 400s.
+    anth_req = {
+        "model": "deepseek-v4-pro",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "user", "content": "weather?"},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "call the tool", "signature": "x"},
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_1",
+                        "name": "get_weather",
+                        "input": {"city": "SF"},
+                    },
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_1",
+                        "content": "sunny",
+                    }
+                ],
+            },
+        ],
+    }
+    oai = openai_format.anthropic_to_openai_request(anth_req)
+    asst = next(
+        m
+        for m in oai["messages"]
+        if m.get("role") == "assistant" and m.get("tool_calls")
+    )
+    assert asst["reasoning_content"] == "call the tool"
+    assert asst["tool_calls"][0]["function"]["name"] == "get_weather"
+
+
+# ── R12 streaming reasoning → thinking block events ──
+async def test_r12_streaming_reasoning_block(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sse_chunks = [
+        b'data: {"choices":[{"delta":{"reasoning_content":"thinking "}}]}\n\n',
+        b'data: {"choices":[{"delta":{"reasoning_content":"hard"}}]}\n\n',
+        b'data: {"choices":[{"delta":{"content":"done"}, "finish_reason":"stop"}], "usage":{"completion_tokens":2}}\n\n',
+        b"data: [DONE]\n\n",
+    ]
+
+    class _MockStream:
+        async def aiter_lines(self):  # type: ignore[no-untyped-def]
+            for c in sse_chunks:
+                yield c.decode().strip()
+
+        async def __aenter__(self):  # type: ignore[no-untyped-def]
+            return self
+
+        async def __aexit__(self, *args):  # type: ignore[no-untyped-def]
+            pass
+
+    monkeypatch.setattr(
+        httpx.AsyncClient, "stream", lambda self, *a, **kw: _MockStream()
+    )
+    r = await client.post(
+        "/v1/messages",
+        json={
+            "model": "deepseek-v4-pro",
+            "max_tokens": 32,
+            "stream": True,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+        headers={"Authorization": f"Bearer {PROXY_SECRET}"},
+    )
+    assert r.status_code == 200
+    body = r.text
+    # A thinking block opens, streams a thinking_delta, then closes with a
+    # signature_delta before the text block.
+    assert "thinking" in body
+    assert "thinking_delta" in body
+    assert "signature_delta" in body
+    assert "text_delta" in body
+    assert body.index("thinking_delta") < body.index("text_delta")
+
+
+# ── R13 debug capture records both sides of the translation ──
+async def test_r13_capture_records_both_sides(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.setenv("LLM_PROXY_CAPTURE_DIR", str(tmp_path))
+    _original_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, **kw):  # type: ignore[no-untyped-def]
+        if str(url).startswith("http"):
+            return httpx.Response(
+                200,
+                json={
+                    "id": "cmpl",
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "hi there"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 2, "completion_tokens": 2},
+                },
+            )
+        return await _original_post(self, url, **kw)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    r = await client.post(
+        "/v1/messages",
+        json={
+            "model": "deepseek-v4-pro",
+            "max_tokens": 32,
+            "messages": [{"role": "user", "content": "hello"}],
+        },
+        headers={"Authorization": f"Bearer {PROXY_SECRET}"},
+    )
+    assert r.status_code == 200
+
+    lines = (tmp_path / "llm-proxy-capture.ndjson").read_text().strip().splitlines()
+    assert len(lines) == 1
+    rec = json.loads(lines[0])
+    assert rec["provider"] == "deepseek" and rec["stream"] is False
+    assert rec["upstream_status"] == 200
+    # Both sides of the request translation are present.
+    assert rec["anthropic_request"]["messages"][0]["content"] == "hello"
+    assert (
+        rec["upstream_request"]["model"] == "deepseek-v4-pro"
+    )  # translated OpenAI body
+    # Translated Anthropic response too.
+    assert rec["anthropic_response"]["content"][0]["text"] == "hi there"
+
+
+def test_r13_capture_disabled_is_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    monkeypatch.delenv("LLM_PROXY_CAPTURE_DIR", raising=False)
+    from mootup_harness_sdk.llm_proxy import capture
+
+    assert capture.enabled() is False
+    capture.record(provider="x", anthropic_request={"k": "v"})  # no-op, must not raise
+    assert not (tmp_path / "llm-proxy-capture.ndjson").exists()

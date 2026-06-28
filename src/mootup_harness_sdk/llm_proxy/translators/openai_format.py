@@ -6,6 +6,13 @@ import json
 import uuid
 from typing import Any
 
+# Synthesized signature for thinking blocks. OpenAI-style reasoning providers
+# (DeepSeek) don't emit Anthropic thinking signatures, but Claude Code needs a
+# non-empty signature to store + echo a thinking block back. It is never
+# cryptographically verified — it round-trips through this proxy, which maps the
+# thinking block back to reasoning_content — so any stable non-empty string works.
+THINKING_SIGNATURE = "moot-proxy-reasoning"
+
 
 def anthropic_to_openai_request(body: dict[str, Any]) -> dict[str, Any]:
     """Translate an Anthropic Messages request into OpenAI Chat Completions shape."""
@@ -29,12 +36,18 @@ def anthropic_to_openai_request(body: dict[str, Any]) -> dict[str, Any]:
             messages.append({"role": role, "content": content})
             continue
         text_parts = []
+        thinking_parts: list[str] = []
         tool_calls: list[dict[str, Any]] = []
         tool_results: list[dict[str, Any]] = []
         for block in content or []:
             btype = block.get("type")
             if btype == "text":
                 text_parts.append(block.get("text", ""))
+            elif btype == "thinking":
+                # Reasoning models (e.g. deepseek-v4-pro) require the prior
+                # turn's reasoning to be echoed back, or they 400. Carry the
+                # thinking text into reasoning_content on the OpenAI message.
+                thinking_parts.append(block.get("thinking", ""))
             elif btype == "tool_use":
                 tool_calls.append(
                     {
@@ -62,18 +75,23 @@ def anthropic_to_openai_request(body: dict[str, Any]) -> dict[str, Any]:
                     }
                 )
         text_content = "\n".join(text_parts) if text_parts else ""
+        reasoning_content = "\n".join(p for p in thinking_parts if p) or None
         if role == "assistant" and tool_calls:
-            messages.append(
-                {
-                    "role": "assistant",
-                    "content": text_content or None,
-                    "tool_calls": tool_calls,
-                }
-            )
+            assistant_msg: dict[str, Any] = {
+                "role": "assistant",
+                "content": text_content or None,
+                "tool_calls": tool_calls,
+            }
+            if reasoning_content:
+                assistant_msg["reasoning_content"] = reasoning_content
+            messages.append(assistant_msg)
         elif tool_results:
             messages.extend(tool_results)
         else:
-            messages.append({"role": role, "content": text_content})
+            plain_msg: dict[str, Any] = {"role": role, "content": text_content}
+            if role == "assistant" and reasoning_content:
+                plain_msg["reasoning_content"] = reasoning_content
+            messages.append(plain_msg)
 
     out: dict[str, Any] = {
         "model": body["model"],
@@ -105,6 +123,14 @@ def openai_to_anthropic_response(
     choice = (resp.get("choices") or [{}])[0]
     msg = choice.get("message", {})
     content_blocks: list[dict[str, Any]] = []
+    reasoning = msg.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        # Thinking must come first in Anthropic content. Synthesize a signature
+        # so Claude Code stores + echoes it (round-tripped back to DeepSeek as
+        # reasoning_content on the next turn).
+        content_blocks.append(
+            {"type": "thinking", "thinking": reasoning, "signature": THINKING_SIGNATURE}
+        )
     text = msg.get("content")
     if isinstance(text, str) and text:
         content_blocks.append({"type": "text", "text": text})

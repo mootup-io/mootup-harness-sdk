@@ -11,7 +11,7 @@ import httpx
 from fastapi import HTTPException, Request, Response
 from sse_starlette.sse import EventSourceResponse
 
-from .. import streaming, tokens
+from .. import capture, streaming, tokens
 from ..translators import openai_format
 
 logger = logging.getLogger("convo.llm_proxy.providers.deepseek")
@@ -65,15 +65,31 @@ async def forward(
     if not stream:
         async with httpx.AsyncClient(timeout=120.0) as client:
             resp = await client.post(UPSTREAM_URL, json=openai_body, headers=headers)
-        if resp.status_code >= 400:
+        ok = resp.status_code < 400
+        anthropic_body = (
+            openai_format.openai_to_anthropic_response(
+                resp.json(), original_model=body["model"]
+            )
+            if ok
+            else None
+        )
+        capture.record(
+            provider="deepseek",
+            model=body.get("model"),
+            stream=False,
+            upstream_url=UPSTREAM_URL,
+            upstream_status=resp.status_code,
+            anthropic_request=body,
+            upstream_request=openai_body,
+            upstream_response=resp.text,
+            anthropic_response=anthropic_body,
+        )
+        if not ok:
             return Response(
                 content=resp.content,
                 status_code=resp.status_code,
                 media_type="application/json",
             )
-        anthropic_body = openai_format.openai_to_anthropic_response(
-            resp.json(), original_model=body["model"]
-        )
         return Response(
             content=json.dumps(anthropic_body).encode(),
             status_code=200,
@@ -82,7 +98,17 @@ async def forward(
 
     return EventSourceResponse(
         streaming.openai_chunks_to_anthropic_sse(
-            UPSTREAM_URL, openai_body, headers, body["model"]
+            UPSTREAM_URL,
+            openai_body,
+            headers,
+            body["model"],
+            capture_meta={
+                "provider": "deepseek",
+                "model": body.get("model"),
+                "upstream_url": UPSTREAM_URL,
+                "anthropic_request": body,
+                "upstream_request": openai_body,
+            },
         ),
         media_type="text/event-stream",
     )
