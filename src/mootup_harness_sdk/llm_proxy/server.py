@@ -33,9 +33,12 @@ async def healthz() -> HealthzResponse:
     )
 
 
-@app.post("/v1/messages")
-async def v1_messages(request: Request) -> Response:
-    body: dict[str, Any] = await request.json()
+def _authorize_and_route(
+    request: Request, body: dict[str, Any]
+) -> tuple[router.Provider, str]:
+    """Shared gate for the message routes: validate the model + bearer token,
+    reject subscription/unknown tokens, and resolve the provider. Returns
+    ``(provider, token_class)`` or raises the matching ``HTTPException``."""
     model = body.get("model")
     if not isinstance(model, str):
         raise HTTPException(status_code=400, detail="Missing or invalid 'model' field")
@@ -62,6 +65,24 @@ async def v1_messages(request: Request) -> Response:
                 "allowed_prefixes": router.ALLOWED_PREFIXES,
             },
         )
+    return provider, token_class
 
+
+@app.post("/v1/messages")
+async def v1_messages(request: Request) -> Response:
+    body: dict[str, Any] = await request.json()
+    provider, token_class = _authorize_and_route(request, body)
     handler = router.dispatch(provider)
+    return await handler(body=body, request=request, token_class=token_class)
+
+
+@app.post("/v1/messages/count_tokens")
+async def v1_messages_count_tokens(request: Request) -> Response:
+    """Claude Code probes token usage before each turn. Without this route the
+    proxy 404s and the turn returns empty. Same auth + prefix routing as
+    ``/v1/messages``; forwards to each provider's Anthropic count_tokens
+    endpoint (Anthropic-shaped both ways, so no translation)."""
+    body: dict[str, Any] = await request.json()
+    provider, token_class = _authorize_and_route(request, body)
+    handler = router.dispatch_count_tokens(provider)
     return await handler(body=body, request=request, token_class=token_class)

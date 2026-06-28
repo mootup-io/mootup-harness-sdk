@@ -39,3 +39,15 @@ def dispatch(provider: Provider) -> Handler:
     if provider == "fireworks":
         return fireworks.forward
     raise ValueError(f"No handler for provider {provider!r}")
+
+
+def dispatch_count_tokens(provider: Provider) -> Handler:
+    from .providers import anthropic, deepseek, fireworks
+
+    if provider == "anthropic":
+        return anthropic.count_tokens
+    if provider == "deepseek":
+        return deepseek.count_tokens
+    if provider == "fireworks":
+        return fireworks.count_tokens
+    raise ValueError(f"No count_tokens handler for provider {provider!r}")

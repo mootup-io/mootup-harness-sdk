@@ -300,3 +300,123 @@ async def test_r8_unsupported_model(client: AsyncClient) -> None:
     )
     assert r.status_code == 400
     assert "unsupported_model" in r.text
+
+
+# ── R9 count_tokens pass-through for providers that support it (claude, deepseek) ──
+@pytest.mark.parametrize(
+    "model,expected_url,auth_header,auth_value",
+    [
+        (
+            "claude-sonnet-4-6",
+            "https://api.anthropic.com/v1/messages/count_tokens",
+            "x-api-key",
+            "sk-ant-api-upstream-test",
+        ),
+        (
+            "deepseek-v4-pro",
+            "https://api.deepseek.com/anthropic/v1/messages/count_tokens",
+            "Authorization",
+            "Bearer ds-test-key",
+        ),
+    ],
+)
+async def test_r9_count_tokens_passthrough(
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    expected_url: str,
+    auth_header: str,
+    auth_value: str,
+) -> None:
+    captured: dict[str, Any] = {}
+    _original_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, **kw):  # type: ignore[no-untyped-def]
+        if str(url).startswith("http"):
+            captured["url"] = str(url)
+            captured["json"] = kw.get("json")
+            captured["headers"] = kw.get("headers")
+            return httpx.Response(200, json={"input_tokens": 42})
+        return await _original_post(self, url, **kw)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    r = await client.post(
+        # Claude Code appends ?beta=true; the route must still match.
+        "/v1/messages/count_tokens?beta=true",
+        json={"model": model, "messages": [{"role": "user", "content": "hi"}]},
+        headers={"Authorization": f"Bearer {PROXY_SECRET}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["input_tokens"] == 42
+    assert captured["url"] == expected_url
+    # Body forwarded verbatim (Anthropic-shaped; no OpenAI translation).
+    assert captured["json"]["model"] == model
+    assert captured["json"]["messages"][0]["content"] == "hi"
+    assert captured["headers"][auth_header] == auth_value
+
+
+# ── R9b Fireworks has no upstream count_tokens → local estimate, no upstream call ──
+async def test_r9b_count_tokens_fireworks_estimates(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mootup_harness_sdk.llm_proxy import tokens
+
+    called = {"upstream": False}
+    _original_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, **kw):  # type: ignore[no-untyped-def]
+        if str(url).startswith("http"):
+            called["upstream"] = True
+            return httpx.Response(404, json={"error": "no route"})
+        return await _original_post(self, url, **kw)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    body = {
+        "model": "accounts/fireworks/models/glm-5p2",
+        "messages": [{"role": "user", "content": "hello world, size me up"}],
+    }
+    r = await client.post(
+        "/v1/messages/count_tokens",
+        json=body,
+        headers={"Authorization": f"Bearer {PROXY_SECRET}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["input_tokens"] == tokens.estimate_input_tokens(body)
+    assert called["upstream"] is False  # no wasted upstream round-trip
+
+
+# ── R9c DeepSeek falls back to a local estimate if upstream count_tokens fails ──
+async def test_r9c_count_tokens_fallback_on_upstream_failure(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mootup_harness_sdk.llm_proxy import tokens
+
+    _original_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, **kw):  # type: ignore[no-untyped-def]
+        if str(url).startswith("http"):
+            return httpx.Response(404, json={"error": "no route"})
+        return await _original_post(self, url, **kw)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    body = {
+        "model": "deepseek-v4-pro",
+        "messages": [{"role": "user", "content": "estimate me"}],
+    }
+    r = await client.post(
+        "/v1/messages/count_tokens",
+        json=body,
+        headers={"Authorization": f"Bearer {PROXY_SECRET}"},
+    )
+    assert r.status_code == 200
+    assert r.json()["input_tokens"] == tokens.estimate_input_tokens(body)
+
+
+# ── R10 count_tokens shares the auth gate (rejects unknown tokens) ──
+async def test_r10_count_tokens_rejects_unknown_token(client: AsyncClient) -> None:
+    r = await client.post(
+        "/v1/messages/count_tokens",
+        json={"model": "deepseek-v4-pro", "messages": []},
+        headers={"Authorization": "Bearer sk-unknown-prefix-XXX"},
+    )
+    assert r.status_code == 403

@@ -11,12 +11,26 @@ import httpx
 from fastapi import HTTPException, Request, Response
 from sse_starlette.sse import EventSourceResponse
 
-from .. import streaming
+from .. import streaming, tokens
 from ..translators import openai_format
 
 logger = logging.getLogger("convo.llm_proxy.providers.fireworks")
 
 UPSTREAM_URL = "https://api.fireworks.ai/inference/v1/chat/completions"
+
+
+async def count_tokens(
+    *, body: dict[str, Any], request: Request, token_class: str
+) -> Response:
+    """Estimate input tokens locally. Fireworks' Anthropic-compatible endpoint
+    has no ``/v1/messages/count_tokens`` route (it 404s), and Claude Code uses
+    count_tokens only to size context before a turn, so a local estimate keeps
+    the turn unblocked."""
+    return Response(
+        content=tokens.estimate_count_tokens_body(body),
+        status_code=200,
+        media_type="application/json",
+    )
 
 
 async def forward(
