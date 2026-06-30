@@ -21,6 +21,7 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ANTHROPIC_API_KEY_UPSTREAM", "sk-ant-api-upstream-test")
     monkeypatch.setenv("DEEPSEEK_API_KEY", "ds-test-key")
     monkeypatch.setenv("FIREWORKS_API_KEY", "fw-test-key")
+    monkeypatch.setenv("OPENAI_API_KEY", "oai-test-key")
 
 
 @pytest.fixture
@@ -141,6 +142,11 @@ async def test_r3_anthropic_passthrough(
             "fireworks/llama-v3p1-70b-instruct",
             "https://api.fireworks.ai/inference/v1/chat/completions",
             "fw-test-key",
+        ),
+        (
+            "gpt-4o",
+            "https://api.openai.com/v1/chat/completions",
+            "oai-test-key",
         ),
     ],
 )
@@ -296,7 +302,7 @@ def test_r7_tool_use_round_trip() -> None:
 async def test_r8_unsupported_model(client: AsyncClient) -> None:
     r = await client.post(
         "/v1/messages",
-        json={"model": "gpt-4-turbo", "max_tokens": 32, "messages": []},
+        json={"model": "gemini-1.5-pro", "max_tokens": 32, "messages": []},
         headers={"Authorization": f"Bearer {PROXY_SECRET}"},
     )
     assert r.status_code == 400
@@ -596,3 +602,130 @@ def test_r13_capture_disabled_is_noop(
     assert capture.enabled() is False
     capture.record(provider="x", anthropic_request={"k": "v"})  # no-op, must not raise
     assert not (tmp_path / "llm-proxy-capture.ndjson").exists()
+
+
+# ── OpenAI provider: routing + request shaping (chat vs reasoning models) ──
+def test_openai_routing() -> None:
+    from mootup_harness_sdk.llm_proxy.router import select_provider
+
+    assert select_provider("gpt-4o") == "openai"
+    assert select_provider("gpt-5-chat-latest") == "openai"
+    assert select_provider("o1") == "openai"
+    assert select_provider("o3-mini") == "openai"
+    assert select_provider("o4-mini") == "openai"
+    assert select_provider("claude-sonnet-4-6") == "anthropic"
+    assert select_provider("deepseek-v4-pro") == "deepseek"
+
+
+async def _capture_openai_upstream(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> dict[str, Any]:
+    """POST `body` to the proxy, mock the OpenAI upstream, return the captured
+    upstream (OpenAI-format) request body."""
+    captured: dict[str, Any] = {}
+    _original_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, **kw):  # type: ignore[no-untyped-def]
+        if str(url).startswith("http"):
+            captured["json"] = kw.get("json")
+            return httpx.Response(
+                200,
+                json={
+                    "id": "cmpl_x",
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {"prompt_tokens": 3, "completion_tokens": 1},
+                },
+            )
+        return await _original_post(self, url, **kw)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    r = await client.post(
+        "/v1/messages", json=body, headers={"Authorization": f"Bearer {PROXY_SECRET}"}
+    )
+    assert r.status_code == 200
+    return captured["json"]
+
+
+async def test_openai_chat_model_uses_max_completion_tokens(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent = await _capture_openai_upstream(
+        client,
+        monkeypatch,
+        {
+            "model": "gpt-4o",
+            "max_tokens": 32,
+            "temperature": 0.7,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    # max_tokens is renamed to max_completion_tokens; chat models keep temperature.
+    assert "max_tokens" not in sent
+    assert sent["max_completion_tokens"] == 32
+    assert sent["temperature"] == 0.7
+    assert "reasoning_effort" not in sent
+
+
+async def test_openai_reasoning_model_drops_temperature(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent = await _capture_openai_upstream(
+        client,
+        monkeypatch,
+        {
+            "model": "o3-mini",
+            "max_tokens": 64,
+            "temperature": 0.7,
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert "max_tokens" not in sent
+    assert sent["max_completion_tokens"] == 64
+    # Reasoning models reject a non-default temperature → dropped.
+    assert "temperature" not in sent
+
+
+async def test_openai_reasoning_effort_from_thinking_budget(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent = await _capture_openai_upstream(
+        client,
+        monkeypatch,
+        {
+            "model": "gpt-5",
+            "max_tokens": 64,
+            "thinking": {"type": "enabled", "budget_tokens": 20000},
+            "messages": [{"role": "user", "content": "hi"}],
+        },
+    )
+    assert sent["reasoning_effort"] == "high"
+
+
+async def test_openai_count_tokens_estimates_without_upstream(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from mootup_harness_sdk.llm_proxy import tokens
+
+    called = {"upstream": False}
+    _original_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, **kw):  # type: ignore[no-untyped-def]
+        if str(url).startswith("http"):
+            called["upstream"] = True
+        return await _original_post(self, url, **kw)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    body = {"model": "gpt-4o", "messages": [{"role": "user", "content": "estimate me"}]}
+    r = await client.post(
+        "/v1/messages/count_tokens",
+        json=body,
+        headers={"Authorization": f"Bearer {PROXY_SECRET}"},
+    )
+    assert r.status_code == 200
+    assert called["upstream"] is False  # OpenAI has no count_tokens endpoint
+    assert r.json()["input_tokens"] == tokens.estimate_input_tokens(body)

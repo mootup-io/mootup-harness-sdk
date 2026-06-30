@@ -29,6 +29,7 @@ async def healthz() -> HealthzResponse:
             "anthropic": bool(os.getenv("ANTHROPIC_API_KEY_UPSTREAM")),
             "deepseek": bool(os.getenv("DEEPSEEK_API_KEY")),
             "fireworks": bool(os.getenv("FIREWORKS_API_KEY")),
+            "openai": bool(os.getenv("OPENAI_API_KEY")),
         },
     )
 
