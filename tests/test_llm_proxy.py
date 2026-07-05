@@ -729,3 +729,71 @@ async def test_openai_count_tokens_estimates_without_upstream(
     assert r.status_code == 200
     assert called["upstream"] is False  # OpenAI has no count_tokens endpoint
     assert r.json()["input_tokens"] == tokens.estimate_input_tokens(body)
+
+
+# ── Codex/OpenAI-compatible proxy surface ──
+async def test_codex_chat_completions_routes_openai_compatible_body(
+    client: AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: dict[str, Any] = {}
+    _original_post = httpx.AsyncClient.post
+
+    async def mock_post(self, url, **kw):  # type: ignore[no-untyped-def]
+        if str(url).startswith("http"):
+            captured["url"] = str(url)
+            captured["json"] = kw.get("json")
+            captured["headers"] = kw.get("headers")
+            return httpx.Response(
+                200,
+                json={
+                    "id": "chatcmpl_codex",
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "ok"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                },
+                headers={"content-type": "application/json"},
+            )
+        return await _original_post(self, url, **kw)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", mock_post)
+    body = {
+        "model": "deepseek-chat",
+        "messages": [{"role": "user", "content": "hi"}],
+        "stream": False,
+    }
+    r = await client.post(
+        "/v1/chat/completions",
+        json=body,
+        headers={"Authorization": f"Bearer {PROXY_SECRET}"},
+    )
+    assert r.status_code == 200
+    assert captured["url"] == "https://api.deepseek.com/v1/chat/completions"
+    assert captured["json"] == body
+    assert captured["headers"]["Authorization"] == "Bearer ds-test-key"
+    assert r.json()["choices"][0]["message"]["content"] == "ok"
+
+
+async def test_codex_chat_completions_rejects_anthropic_model(
+    client: AsyncClient,
+) -> None:
+    r = await client.post(
+        "/v1/chat/completions",
+        json={"model": "claude-sonnet-4-6", "messages": []},
+        headers={"Authorization": f"Bearer {PROXY_SECRET}"},
+    )
+    assert r.status_code == 400
+    assert "unsupported_openai_compat_model" in r.text
+
+
+async def test_codex_chat_completions_requires_proxy_secret(
+    client: AsyncClient,
+) -> None:
+    r = await client.post(
+        "/v1/chat/completions",
+        json={"model": "gpt-4o", "messages": []},
+        headers={"Authorization": "Bearer sk-ant-api-user"},
+    )
+    assert r.status_code == 403
